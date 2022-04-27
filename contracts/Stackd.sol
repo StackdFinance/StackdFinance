@@ -197,6 +197,10 @@ interface IERC20Extended {
     );
 }
 
+interface IStackedStaking {
+    function stakedTokens(address user) external returns (uint256);
+}
+
 abstract contract Auth {
     address internal owner;
     mapping(address => bool) internal authorizations;
@@ -241,29 +245,70 @@ abstract contract Auth {
     event OwnershipTransferred(address owner);
 }
 
-contract LotteryManager {
-    using SafeMath for uint;
+interface IDividendDistributor {
+    function setDistributionCriteria(
+        uint256 _minPeriod,
+        uint256 _minDistribution
+    ) external;
+
+    function setShare(address shareholder, uint256 amount) external;
+
+    function deposit() external payable;
+
+    function process(uint256 gas) external;
+
+    function claimDividend(address _user) external;
+
+    function getPaidEarnings(address shareholder)
+    external
+    view
+    returns (uint256);
+
+    function getUnpaidEarnings(address shareholder)
+    external
+    view
+    returns (uint256);
+
+    function totalDistributed() external view returns (uint256);
+}
+
+contract DividendDistributor is IDividendDistributor {
+    using SafeMath for uint256;
 
     address public _token;
-    uint public minimumHolding;
-    uint public totalShares;
+
+    struct Share {
+        uint256 amount;
+        uint256 totalExcluded;
+        uint256 totalRealised;
+    }
+
+    IERC20Extended public rewardToken =
+    IERC20Extended(0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56);
+    IDexRouter public router;
 
     address[] public shareholders;
-    mapping(address => uint) public shareholderIndexes;
-    mapping(address => uint) public shares;
+    mapping(address => uint256) public shareholderIndexes;
+    mapping(address => uint256) public shareholderClaims;
 
-    // Lottery
-    mapping(address => bool) public excludedFromLottery;
-    mapping(uint => address[]) public winners;
-    mapping(uint => bool) public drawingCompleted;
-    uint public minHolding;
-    uint public iteration;
-    uint public numWinners;
-    uint public lastDrawing;
-    uint public timeBetweenDrawings;
+    mapping(address => Share) public shares;
 
-    constructor(address router_) {
-        _token = msg.sender;
+    uint256 public totalShares;
+    uint256 public totalDividends;
+    uint256 public totalDistributed;
+    uint256 public dividendsPerShare;
+    uint256 public dividendsPerShareAccuracyFactor = 10**36;
+
+    uint256 public minPeriod = 1 hours;
+    uint256 public minDistribution = 1 * (10**rewardToken.decimals());
+
+    uint256 currentIndex;
+
+    bool initialized;
+    modifier initializer() {
+        require(!initialized);
+        _;
+        initialized = true;
     }
 
     modifier onlyToken() {
@@ -271,35 +316,159 @@ contract LotteryManager {
         _;
     }
 
-    function setExcludedFromLottery(address user, bool value) external onlyToken {
-        excludedFromLottery[user] = value;
+    constructor(address router_) {
+        _token = msg.sender;
+        router = IDexRouter(router_);
     }
 
-    function setMinHolding(uint newMin) external onlyToken {
-        minHolding = newMin;
+    function setDistributionCriteria(
+        uint256 _minPeriod,
+        uint256 _minDistribution
+    ) external override onlyToken {
+        minPeriod = _minPeriod;
+        minDistribution = _minDistribution;
     }
-
-    function setTimeBetweenDrawings(uint newTime) external onlyToken {
-        timeBetweenDrawings = newTime;
-    }
-
-    function setNumWinners(uint number) external onlyToken {
-        number = number;
-    }
-
 
     function setShare(address shareholder, uint256 amount)
     external
+    override
     onlyToken
     {
-        if (amount > minimumHolding && shares[shareholder] == 0) {
+        if (shares[shareholder].amount > 0) {
+            distributeDividend(shareholder);
+        }
+
+        if (amount > 0 && shares[shareholder].amount == 0) {
             addShareholder(shareholder);
-        } else if (amount == 0 && shares[shareholder] > minimumHolding) {
+        } else if (amount == 0 && shares[shareholder].amount > 0) {
             removeShareholder(shareholder);
         }
 
-        totalShares = totalShares.sub(shares[shareholder]).add(amount);
-        shares[shareholder] = amount;
+        totalShares = totalShares.sub(shares[shareholder].amount).add(amount);
+        shares[shareholder].amount = amount;
+        shares[shareholder].totalExcluded = getCumulativeDividends(
+            shares[shareholder].amount
+        );
+    }
+
+    function deposit() external payable override onlyToken {
+        uint256 balanceBefore = rewardToken.balanceOf(address(this));
+
+        address[] memory path = new address[](2);
+        path[0] = router.WETH();
+        path[1] = address(rewardToken);
+
+        router.swapExactETHForTokensSupportingFeeOnTransferTokens{
+        value: msg.value
+        }(0, path, address(this), block.timestamp);
+
+        uint256 amount = rewardToken.balanceOf(address(this)).sub(
+            balanceBefore
+        );
+
+        totalDividends = totalDividends.add(amount);
+        dividendsPerShare = dividendsPerShare.add(
+            dividendsPerShareAccuracyFactor.mul(amount).div(totalShares)
+        );
+    }
+
+    function process(uint256 gas) external override onlyToken {
+        uint256 shareholderCount = shareholders.length;
+
+        if (shareholderCount == 0) {
+            return;
+        }
+
+        uint256 gasUsed = 0;
+        uint256 gasLeft = gasleft();
+
+        uint256 iterations = 0;
+
+        while (gasUsed < gas && iterations < shareholderCount) {
+            if (currentIndex >= shareholderCount) {
+                currentIndex = 0;
+            }
+
+            if (shouldDistribute(shareholders[currentIndex])) {
+                distributeDividend(shareholders[currentIndex]);
+            }
+
+            gasUsed = gasUsed.add(gasLeft.sub(gasleft()));
+            gasLeft = gasleft();
+            currentIndex++;
+            iterations++;
+        }
+    }
+
+    function shouldDistribute(address shareholder)
+    internal
+    view
+    returns (bool)
+    {
+        return
+        shareholderClaims[shareholder] + minPeriod < block.timestamp &&
+        getUnpaidEarnings(shareholder) > minDistribution;
+    }
+
+    function distributeDividend(address shareholder) internal {
+        if (shares[shareholder].amount == 0) {
+            return;
+        }
+
+        uint256 amount = getUnpaidEarnings(shareholder);
+        if (amount > 0) {
+            totalDistributed = totalDistributed.add(amount);
+            rewardToken.transfer(shareholder, amount);
+            shareholderClaims[shareholder] = block.timestamp;
+            shares[shareholder].totalRealised = shares[shareholder]
+            .totalRealised
+            .add(amount);
+            shares[shareholder].totalExcluded = getCumulativeDividends(
+                shares[shareholder].amount
+            );
+        }
+    }
+
+    function claimDividend(address _user) external {
+        distributeDividend(_user);
+    }
+
+    function getPaidEarnings(address shareholder)
+    public
+    view
+    returns (uint256)
+    {
+        return shares[shareholder].totalRealised;
+    }
+
+    function getUnpaidEarnings(address shareholder)
+    public
+    view
+    returns (uint256)
+    {
+        if (shares[shareholder].amount == 0) {
+            return 0;
+        }
+
+        uint256 shareholderTotalDividends = getCumulativeDividends(
+            shares[shareholder].amount
+        );
+        uint256 shareholderTotalExcluded = shares[shareholder].totalExcluded;
+
+        if (shareholderTotalDividends <= shareholderTotalExcluded) {
+            return 0;
+        }
+
+        return shareholderTotalDividends.sub(shareholderTotalExcluded);
+    }
+
+    function getCumulativeDividends(uint256 share)
+    internal
+    view
+    returns (uint256)
+    {
+        return
+        share.mul(dividendsPerShare).div(dividendsPerShareAccuracyFactor);
     }
 
     function addShareholder(address shareholder) internal {
@@ -316,66 +485,41 @@ contract LotteryManager {
         ] = shareholderIndexes[shareholder];
         shareholders.pop();
     }
-
-    // Lottery Functions
-    function random() internal view returns (uint) {
-        return uint(keccak256(abi.encodePacked(block.timestamp, msg.sender, block.difficulty))) % shareholders.length;
-    }
-
-
-    function distributeWinnings() internal {
-        uint total = address(this).balance;
-        uint denominator = 0;
-        for (uint i = 0; i < winners[iteration - 1].length; i++) {
-            denominator += shares[winners[iteration - 1][i]];
-        }
-        for (uint i = 0; i < winners[iteration - 1].length; i++) {
-            uint percentageTotal = (shares[winners[iteration - 1][i]] * 10000) / denominator; // percentage of pot in basis points
-            uint owed = (total * percentageTotal) / 10000;
-            payable(winners[iteration - 1][i]).transfer(owed);
-        }
-    }
-
-    function pickWinners() external onlyToken {
-        require(!drawingCompleted[iteration], "This drawing has already concluded");
-        require(block.timestamp > lastDrawing + timeBetweenDrawings, "You cant pick winners yet");
-
-        for (uint i = 0; i < numWinners; i++) {
-            uint winner = random();
-            winners[iteration][i] = shareholders[winner];
-        }
-        iteration += 1;
-        lastDrawing = block.timestamp;
-        distributeWinnings();
-    }
-
 }
 
-
-
-
-contract Jackpot is IERC20Extended, Auth {
+contract STACKDFinance is IERC20Extended, Auth {
     using SafeMath for uint256;
 
-    string private constant _name = "Jackpot Token";
-    string private constant _symbol = "JACK";
+    string private constant _name = "STACKD Finance";
+    string private constant _symbol = "STACKD";
     uint8 private constant _decimals = 18;
     uint256 private constant _totalSupply =
-    1000000 * 10**_decimals;
+    20_000_000_000 * 10**_decimals;
 
+    address public rewardToken = 0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56; // BUSD
     address public constant DEAD = address(0xdead);
     address public constant ZERO = address(0);
-    address public constant ROUTER = 0x10ED43C718714eb63d5aA57B78B54704E256024E;
     address public pair;
     address public autoLiquidityReceiver = 0x393B9D84495FdAf7098dd623260Af93274F4Bcb1; // address to receive LP tokens from liquidity add from fee
+    address public marketingFeeReceiver = 0xEe8948866c7885e36C928cfd702947512cf7067e; // address to receive marketing fee
+    address public stakingFeeReceiver = 0x550DbD64c3dA1E285A1598784013d79a84dEd60F; // address to receive staking fee
 
     // fees info
     uint256 public liquidityFee = 200;
-    uint256 public lotteryFee = 1000;
-    uint256 public totalFee = 1200;
+    uint256 public buybackFee = 100;
+    uint256 public reflectionFee = 1500;
+    uint256 public marketingFee = 100;
+    uint256 public stakingFee = 100;
+    uint256 public totalFee = 2000;
     uint256 public feeDenominator = 10000;
     uint256 public sellMultiplier = 1;
 
+    // Determines whether to add liquidity fee to liquidity, target liquidity is 25%
+    uint256 public targetLiquidity = 25;
+    uint256 public targetLiquidityDenominator = 100;
+
+    uint256 public distributorGas = 500000;
+    uint256 public antiWhaleSellLimitDenominator = 1000;
     uint256 public swapThreshold = _totalSupply / 20000;
     uint256 public startBlock;
     uint256 private deadBlocks;
@@ -383,15 +527,19 @@ contract Jackpot is IERC20Extended, Auth {
 
     bool public sellMultiplierEnabled;
     bool public swapEnabled = true;
+    bool public enableStaking;
     bool public tradingEnabled;
 
     mapping(address => uint256) private _balances;
     mapping(address => mapping(address => uint256)) private _allowances;
     mapping(address => bool) public isFeeExempt;
+    mapping(address => bool) public isDividendExempt;
     mapping(address => bool) public canTransferBeforeTradingIsEnabled;
+    mapping(address => bool) public excludedFromSellLimit;
 
+    DividendDistributor public distributor;
+    IStackedStaking public stake;
     IDexRouter public router;
-    LotteryManager public lottery;
 
     event AutoLiquify(uint256 amountBNB, uint256 amountBOG);
 
@@ -403,23 +551,32 @@ contract Jackpot is IERC20Extended, Auth {
     }
 
 
-    constructor(address _lottery)
+    constructor()
     payable
     Auth(msg.sender)
     {
-        lottery = new LotteryManager(ROUTER);
-        router = IDexRouter(ROUTER);
+
+        router = IDexRouter(0x10ED43C718714eb63d5aA57B78B54704E256024E);
         pair = IUniswapV2Factory(router.factory()).createPair(
             address(this),
             router.WETH()
         );
-        isFeeExempt[msg.sender] = true;
-        isFeeExempt[autoLiquidityReceiver] = true;
+        distributor = new DividendDistributor(0x10ED43C718714eb63d5aA57B78B54704E256024E);
 
-        setExcludedFromLottery(pair, true);
-        setExcludedFromLottery(msg.sender, true);
+        isFeeExempt[msg.sender] = true;
+        isFeeExempt[marketingFeeReceiver] = true;
+        isFeeExempt[autoLiquidityReceiver] = true;
+        isFeeExempt[stakingFeeReceiver] = true;
+
+        isDividendExempt[msg.sender] = true;
+        isDividendExempt[autoLiquidityReceiver] = true;
+        isDividendExempt[pair] = true;
+        isDividendExempt[address(this)] = true;
+        isDividendExempt[DEAD] = true;
+        isDividendExempt[ZERO] = true;
 
         canTransferBeforeTradingIsEnabled[msg.sender] = true;
+        canTransferBeforeTradingIsEnabled[marketingFeeReceiver] = true;
 
         _allowances[address(this)][address(router)] = _totalSupply;
         _allowances[address(this)][address(pair)] = _totalSupply;
@@ -443,6 +600,20 @@ contract Jackpot is IERC20Extended, Auth {
         startBlock = block.number;
         deadBlocks = _deadBlocks;
         sniperFee = _sniperFee; // in basis points, base 10000
+    }
+
+
+    // Whitelist pinksale
+    function setPresale(
+        address presaleAddress
+    )
+    external
+    authorized
+    {
+        isFeeExempt[presaleAddress] = true;
+        isDividendExempt[presaleAddress] = true;
+        canTransferBeforeTradingIsEnabled[presaleAddress] = true;
+        excludedFromSellLimit[presaleAddress] = true;
     }
 
 
@@ -579,12 +750,24 @@ contract Jackpot is IERC20Extended, Auth {
             require(canTransferBeforeTradingIsEnabled[sender], "You cannot transfer before trading is enabled");
         }
 
+        if (enableStaking) {
+            require(
+                _balances[sender].sub(amount) >= stake.stakedTokens(sender),
+                "Can not send staked token"
+            );
+        }
+
+        if (recipient == pair && sender != owner && !excludedFromSellLimit[sender]) {
+            uint256 sellLimit = getAntiWhaleSellLimit();
+            require(amount <= sellLimit, "Antiwhale limit exceeded");
+        }
+
         if (inSwap) {
             return _basicTransfer(sender, recipient, amount);
         }
 
         if (shouldSwapBack()) {
-            swapBack(swapThreshold);
+            swapBack();
         }
 
         _balances[sender] = _balances[sender].sub(
@@ -604,16 +787,18 @@ contract Jackpot is IERC20Extended, Auth {
             : amount;
         }
 
-        // TODO: Handle Lottery Stuff Here
-        if (!lottery.excludedFromLottery(sender)) {
-            try lottery.setShare(sender, _balances[sender]) {} catch {}
-        }
-
         _balances[recipient] = _balances[recipient].add(amountReceived);
 
-        if (!lottery.excludedFromLottery(recipient)) {
-            try lottery.setShare(sender, _balances[sender]) {} catch {}
+        if (!isDividendExempt[sender]) {
+            try distributor.setShare(sender, _balances[sender]) {} catch {}
         }
+        if (!isDividendExempt[recipient]) {
+            try
+            distributor.setShare(recipient, _balances[recipient])
+            {} catch {}
+        }
+
+        try distributor.process(distributorGas) {} catch {}
 
         emit Transfer(sender, recipient, amountReceived);
         return true;
@@ -635,43 +820,6 @@ contract Jackpot is IERC20Extended, Auth {
         _balances[recipient] = _balances[recipient].add(amount);
         emit Transfer(sender, recipient, amount);
         return true;
-    }
-
-    // Lottery Functions
-    function timeUntilDraw() external returns (uint){
-        uint nextDrawing = lottery.lastDrawing() + lottery.timeBetweenDrawings();
-        if (block.timestamp >= nextDrawing) {
-            return 0;
-        }
-        else {
-            return nextDrawing - block.timestamp;
-        }
-    }
-
-    function pickWinners() external {
-        require(!lottery.drawingCompleted(lottery.iteration()), "This drawing has already concluded");
-        require(block.timestamp > lottery.lastDrawing() + lottery.timeBetweenDrawings(), "You cant pick winners yet");
-        if (balanceOf(address(this)) > 0) {
-            triggerSwapBack();
-        }
-        payable(address(lottery)).transfer(address(this).balance);
-        lottery.pickWinners();
-    }
-
-    function setNumWinners(uint numWinners) external authorized {
-        lottery.setNumWinners(numWinners);
-    }
-
-    function setMinHolding(uint minHolding) external authorized {
-        lottery.setMinHolding(minHolding);
-    }
-
-    function setTimeBetweenDrawings(uint timeBetween) external authorized {
-        lottery.setTimeBetweenDrawings(timeBetween);
-    }
-
-    function setExcludedFromLottery(address user, bool value) public authorized {
-        lottery.setExcludedFromLottery(user, value);
     }
 
 
@@ -768,23 +916,27 @@ contract Jackpot is IERC20Extended, Auth {
         _balances[address(this)] >= swapThreshold;
     }
 
-    function triggerSwapBack()
-    internal
-    {
-        uint balance = balanceOf(address(this));
-        swapBack(balance);
-    }
 
-
-    function swapBack(uint _swapThreshold)
+    function swapBack()
     internal
     swapping
     {
-        uint256 amountToLiquify = _swapThreshold
-        .mul(liquidityFee)
+        uint256 amountTokenStaking = swapThreshold.mul(stakingFee).div(
+            totalFee
+        );
+        uint256 dynamicLiquidityFee = isOverLiquified(
+            targetLiquidity,
+            targetLiquidityDenominator
+        )
+        ? 0
+        : liquidityFee;
+        uint256 amountToLiquify = swapThreshold
+        .mul(dynamicLiquidityFee)
         .div(totalFee)
         .div(2);
-        uint256 amountToSwap = _swapThreshold.sub(amountToLiquify);
+        uint256 amountToSwap = swapThreshold.sub(amountToLiquify).sub(
+            amountTokenStaking
+        );
 
         address[] memory path = new address[](2);
         path[0] = address(this);
@@ -801,13 +953,26 @@ contract Jackpot is IERC20Extended, Auth {
 
         uint256 amountBNB = address(this).balance.sub(balanceBefore);
 
-        uint256 totalBNBFee = totalFee.sub(liquidityFee.div(2));
+        uint256 totalBNBFee = totalFee.sub(dynamicLiquidityFee.div(2)).sub(
+            stakingFee
+        );
 
         uint256 amountBNBLiquidity = amountBNB
-        .mul(liquidityFee)
+        .mul(dynamicLiquidityFee)
         .div(totalBNBFee)
         .div(2);
+        uint256 amountBNBReflection = amountBNB.mul(reflectionFee).div(
+            totalBNBFee
+        );
+        uint256 amountBNBMarketing = amountBNB.mul(marketingFee).div(
+            totalBNBFee
+        );
 
+        try distributor.deposit{value: amountBNBReflection}() {} catch {}
+        payable(marketingFeeReceiver).transfer(amountBNBMarketing);
+        _balances[stakingFeeReceiver] = _balances[stakingFeeReceiver].add(
+            amountTokenStaking
+        );
 
         if (amountToLiquify > 0) {
             router.addLiquidityETH{value: amountBNBLiquidity}(
@@ -822,6 +987,73 @@ contract Jackpot is IERC20Extended, Auth {
         }
     }
 
+
+    // Buyback and burn
+    function triggerManualBuyback(
+        uint256 amount
+    )
+    external
+    authorized
+    {
+        buyTokens(amount, DEAD);
+    }
+
+
+    function buyTokens(
+        uint256 amount,
+        address to
+    )
+    internal
+    swapping
+    {
+        address[] memory path = new address[](2);
+        path[0] = router.WETH();
+        path[1] = address(this);
+
+        router.swapExactETHForTokensSupportingFeeOnTransferTokens{
+        value: amount
+        }(0, path, to, block.timestamp);
+    }
+
+
+    function claimDividend()
+    external
+    {
+        distributor.claimDividend(msg.sender);
+    }
+
+
+    function getPaidDividend(
+        address shareholder
+    )
+    public
+    view
+    returns (uint256)
+    {
+        return distributor.getPaidEarnings(shareholder);
+    }
+
+
+    function getUnpaidDividend(
+        address shareholder
+    )
+    external
+    view
+    returns (uint256)
+    {
+        return distributor.getUnpaidEarnings(shareholder);
+    }
+
+
+    function getTotalDistributedDividend()
+    external
+    view
+    returns (uint256)
+    {
+        return distributor.totalDistributed();
+    }
+
+
     function setRoute(
         address _router,
         address _pair
@@ -831,6 +1063,23 @@ contract Jackpot is IERC20Extended, Auth {
     {
         router = IDexRouter(_router);
         pair = _pair;
+    }
+
+
+    function setIsDividendExempt(
+        address holder,
+        bool exempt
+    )
+    external
+    authorized
+    {
+        require(holder != address(this) && holder != pair);
+        isDividendExempt[holder] = exempt;
+        if (exempt) {
+            distributor.setShare(holder, 0);
+        } else {
+            distributor.setShare(holder, _balances[holder]);
+        }
     }
 
 
@@ -845,17 +1094,38 @@ contract Jackpot is IERC20Extended, Auth {
     }
 
 
+    function setExcludedFromSellLimit(
+        address _address,
+        bool _value
+    )
+    external
+    authorized
+    {
+        excludedFromSellLimit[_address] = _value;
+    }
+
+
     function setFees(
         uint256 _liquidityFee,
-        uint256 _lotteryFee,
+        uint256 _buybackFee,
+        uint256 _reflectionFee,
+        uint256 _marketingFee,
+        uint256 _stakingFee,
         uint256 _feeDenominator
     )
     external
     authorized
     {
         liquidityFee = _liquidityFee;
-        lotteryFee = _lotteryFee;
-        totalFee = _liquidityFee.add(_lotteryFee);
+        buybackFee = _buybackFee;
+        reflectionFee = _reflectionFee;
+        marketingFee = _marketingFee;
+        stakingFee = _stakingFee;
+        totalFee = _liquidityFee
+        .add(_buybackFee)
+        .add(_reflectionFee)
+        .add(_marketingFee)
+        .add(_stakingFee);
         feeDenominator = _feeDenominator;
         require(
             totalFee < feeDenominator / 4,
@@ -865,12 +1135,28 @@ contract Jackpot is IERC20Extended, Auth {
 
 
     function setFeeReceivers(
-        address _autoLiquidityReceiver
+        address _autoLiquidityReceiver,
+        address _marketingFeeReceiver,
+        address _stakingFeeReceiver
     )
     external
     authorized
     {
         autoLiquidityReceiver = _autoLiquidityReceiver;
+        marketingFeeReceiver = _marketingFeeReceiver;
+        stakingFeeReceiver = _stakingFeeReceiver;
+    }
+
+
+    function setStakeAddress(
+        address _staking,
+        bool _enable
+    )
+    external
+    authorized
+    {
+        stake = IStackedStaking(_staking);
+        enableStaking = _enable;
     }
 
 
@@ -886,12 +1172,93 @@ contract Jackpot is IERC20Extended, Auth {
     }
 
 
+    function setTargetLiquidity(
+        uint256 _target,
+        uint256 _denominator
+    )
+    external
+    authorized
+    {
+        targetLiquidity = _target;
+        targetLiquidityDenominator = _denominator;
+    }
+
+
+    function setDistributionCriteria(
+        uint256 _minPeriod,
+        uint256 _minDistribution
+    )
+    external
+    authorized
+    {
+        distributor.setDistributionCriteria(_minPeriod, _minDistribution);
+    }
+
+
+    function setDistributorSettings(
+        uint256 gas
+    )
+    external
+    authorized
+    {
+        require(gas < 750000, "Gas must be lower than 750000");
+        distributorGas = gas;
+    }
+
+
+    function setAntiWhaleSellLimitDenominator(
+        uint256 newDenominator
+    )
+    external
+    authorized
+    {
+        require(
+            newDenominator <= 100000,
+            "amount must be greater than 0.001% of circulating supply supply"
+        );
+        antiWhaleSellLimitDenominator = newDenominator;
+    }
+
+
     function getCirculatingSupply()
     public
     view
     returns (uint256)
     {
         return _totalSupply.sub(balanceOf(DEAD)).sub(balanceOf(ZERO));
+    }
+
+    function getAntiWhaleSellLimit()
+    public
+    view
+    returns (uint256)
+    {
+        return getCirculatingSupply()/antiWhaleSellLimitDenominator;
+    }
+
+
+    // Determines what percent of market cap is backed
+    function getLiquidityBacking(
+        uint256 accuracy
+    )
+    public
+    view
+    returns (uint256)
+    {
+        return accuracy.mul(balanceOf(pair).mul(2)).div(getCirculatingSupply());
+    }
+
+
+    // Determines if target liquidity is met
+    function isOverLiquified(
+        uint256 target,
+        uint256 accuracy
+    )
+    public
+    view
+    returns (bool)
+    {
+        return getLiquidityBacking(accuracy) > target;
     }
 
 
